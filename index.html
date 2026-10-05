@@ -154,6 +154,17 @@
   .demo-actions .status{font-size:.9375rem;color:var(--muted)}
   .output[hidden]{display:none}
 
+  /* Live demo: stats line, messages, loading spinner */
+  .stats{margin-top:1rem;font-size:.9375rem;font-weight:600;color:var(--accent-ink)}
+  .output .report{margin-top:2rem}
+  .notice{margin-top:1.5rem;padding:1rem 1.25rem;border:1px solid var(--line);border-radius:10px;background:#F6F8F8}
+  .notice h3{font-size:1rem}
+  .notice p{margin-top:.35rem;color:var(--muted)}
+  .notice.warn{background:#FFF8EA;border-color:#F1DFB5}
+  .notice.err{background:#FDF1F1;border-color:#F3CFD0}
+  .spinner{width:1em;height:1em;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:sl-spin .8s linear infinite}
+  @keyframes sl-spin{to{transform:rotate(360deg)}}
+
   /* Footer */
   footer{padding:2.5rem 0 3rem;font-size:.9375rem;color:var(--muted);border-top:1px solid var(--line)}
   footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:1rem}
@@ -225,7 +236,7 @@
       <p class="sub">A free readiness check for how your resume is likely to read to a PM or strategy shortlister, and which bullet may be holding you back.</p>
       <div class="hero-cta">
         <a class="btn" href="#demo">Check my resume</a>
-        <span class="hero-note">Free. No sign-up. Live check launching soon. Uses only your role choices and pasted bullets. Submissions are saved to improve the tool (<a href="#faq-data" id="faq-data-link">see FAQ</a>).</span>
+        <span class="hero-note">Free. No sign-up. Uses only your role choices and pasted bullets. Submissions are saved to improve the tool (<a href="#faq-data" id="faq-data-link">see FAQ</a>).</span>
       </div>
     </div>
   </section>
@@ -388,7 +399,7 @@
       <div class="note">
         <h2 id="founder-title">A note from the builder</h2>
         <p>I'm an MBA student at ISB, building ShortlistLens because I think many capable switchers add courses when their resume is the real gap.</p>
-        <p>This is an early version. Once the live check opens, if a report misses the mark, I want to hear about it.</p>
+        <p>This is an early version. If a report misses the mark, I want to hear about it.</p>
         <!-- CUSTOMISE: your name and a real contact link -->
         <p class="sign">Harsh Kalra, ISB Class of 2027. <a href="mailto:nhkalra5@gmail.com">Send feedback</a></p>
       </div>
@@ -424,7 +435,9 @@
   <section class="demo" id="demo" aria-labelledby="demo-title">
     <div class="wrap">
       <h2 id="demo-title">Check your resume</h2>
-      <p class="lede">The live check is being connected. You can fill this in now to see what it will ask for.</p>
+      <p class="lede">Pick your switch, paste your top bullets and get your 4-part report in about 10 seconds. Up to 3 free checks a day.</p>
+      <!-- Live usage stats, filled from /api/stats; stays hidden until there are 5+ checks -->
+      <p class="stats" id="demo-stats" hidden></p>
 
       <form class="demo-box" id="demo-form" novalidate>
         <div class="field-row">
@@ -462,12 +475,12 @@
         </div>
 
         <div class="demo-actions">
-          <!-- NEXT WEEK: remove disabled, change label to "Analyse", wire submit handler to Gemini endpoint -->
-          <button type="submit" class="btn" id="analyse-btn" disabled aria-describedby="demo-status">Live demo launching soon</button>
-          <span class="status" id="demo-status">Analysis is not live yet.</span>
+          <!-- Submits to /api/check (see script at the bottom of the page) -->
+          <button type="submit" class="btn" id="analyse-btn" aria-describedby="demo-status">Analyse</button>
+          <span class="status" id="demo-status">Takes about 10 seconds.</span>
         </div>
 
-        <!-- Report container for the Gemini response (kept hidden until live) -->
+        <!-- Report container: filled with the 4-part report, a refusal or an error message -->
         <div class="output" id="report-output" aria-live="polite" hidden></div>
       </form>
     </div>
@@ -513,9 +526,207 @@
       document.getElementById('faq-data').open = true;
     });
 
-    // Placeholder: replace with the Gemini call next week.
+    // ---------- Live check ----------
+    var MIN = 20;
+    var TIMEOUT_MS = 20000;
+    var btn = document.getElementById('analyse-btn');
+    var statusEl = document.getElementById('demo-status');
+    var output = document.getElementById('report-output');
+    var statsEl = document.getElementById('demo-stats');
+    var currentSel = document.getElementById('current-role');
+    var targetSel = document.getElementById('target-role');
+    var DEFAULT_STATUS = statusEl.textContent;
+
+    // Readable labels for the gap codes returned by the API.
+    var GAP_LABELS = {
+      tasks_not_decisions: 'Bullets describe tasks, not decisions',
+      no_user_or_problem: 'No user or problem named',
+      no_outcome: 'No outcome or result shown',
+      too_technical: 'Too technical for the target role',
+      unclear_scope: 'Scope and ownership are unclear'
+    };
+
+    // One random anonymous ID per browser, kept in localStorage. Used only for the 3-a-day cap.
+    var visitorId = (function () {
+      var KEY = 'sl_visitor_id';
+      var id = null;
+      try { id = localStorage.getItem(KEY); } catch (e) {}
+      if (!id || !/^[A-Za-z0-9-]{8,64}$/.test(id)) {
+        id = (window.crypto && crypto.randomUUID)
+          ? crypto.randomUUID()
+          : 'v-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+        try { localStorage.setItem(KEY, id); } catch (e) {}
+      }
+      return id;
+    })();
+
+    // Small helper: create an element with a class and plain text (text is never parsed as HTML).
+    function el(tag, cls, text) {
+      var n = document.createElement(tag);
+      if (cls) n.className = cls;
+      if (text != null) n.textContent = text;
+      return n;
+    }
+
+    // One numbered card, same markup as the sample report.
+    function part(num, labelCls, title, children) {
+      var box = el('div', 'part');
+      var h = el('h3', 'label ' + labelCls);
+      var n = el('span', 'n', String(num));
+      n.setAttribute('aria-hidden', 'true');
+      h.appendChild(n);
+      h.appendChild(document.createTextNode(title));
+      box.appendChild(h);
+      children.forEach(function (c) { box.appendChild(c); });
+      return box;
+    }
+
+    // Rewrite text with [brackets] shown as dashed "fill this in" slots.
+    function rewriteEl(text) {
+      var p = el('p', 'rewrite');
+      text.split(/(\[[^\]]+\])/).forEach(function (bit) {
+        if (!bit) return;
+        p.appendChild(/^\[.*\]$/.test(bit) ? el('span', 'slot', bit) : document.createTextNode(bit));
+      });
+      return p;
+    }
+
+    function show(node) {
+      output.innerHTML = '';
+      output.appendChild(node);
+      output.hidden = false;
+      var reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+      output.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'start' });
+    }
+
+    // Plain-English message box: kind is 'warn' (limits, refusals) or 'err' (problems).
+    function showNotice(kind, title, message) {
+      var box = el('div', 'notice ' + kind);
+      box.setAttribute('role', kind === 'err' ? 'alert' : 'status');
+      box.appendChild(el('h3', null, title));
+      box.appendChild(el('p', null, message));
+      show(box);
+    }
+
+    // Builds the 4-part report card in the same style as the sample section.
+    function showReport(r, fromRole, toRole, remaining) {
+      var art = el('article', 'report');
+      art.setAttribute('aria-label', 'Your ShortlistLens report');
+
+      var bar = el('div', 'app-bar');
+      var brand = el('span', 'app-brand');
+      brand.innerHTML = '<svg width="18" height="18" viewBox="0 0 32 32" aria-hidden="true"><circle cx="14" cy="14" r="9" fill="none" stroke="#0E5E63" stroke-width="3"/><path d="M21 21l7 7" stroke="#0E5E63" stroke-width="3" stroke-linecap="round"/></svg>ShortlistLens <span class="crumb">/ Report</span>';
+      bar.appendChild(brand);
+      bar.appendChild(el('span', 'app-badge', 'Your report'));
+      art.appendChild(bar);
+
+      var head = el('div', 'report-head');
+      head.appendChild(el('span', 'chip', fromRole));
+      head.appendChild(el('span', 'chip', 'Target: ' + toRole));
+      art.appendChild(head);
+
+      var grid = el('div', 'report-grid');
+      grid.appendChild(part(1, 'l1', 'How you come across', [el('p', null, r.read)]));
+      grid.appendChild(part(2, 'l2', 'The bullet that pigeonholes you', [
+        el('p', 'quote', '"' + r.flagged_bullet + '"'),
+        el('p', 'why', r.why)
+      ]));
+      grid.appendChild(part(3, 'l3', 'A rewrite from your real experience', [
+        rewriteEl(r.rewrite),
+        el('p', 'why', 'Brackets mark facts only you know. ShortlistLens is designed not to invent numbers or outcomes.')
+      ]));
+      grid.appendChild(part(4, 'l4', 'One thing to stop doing', [el('p', null, r.stop_doing)]));
+      art.appendChild(grid);
+
+      var left = typeof remaining === 'number'
+        ? ' You have ' + remaining + ' free check' + (remaining === 1 ? '' : 's') + ' left today.'
+        : '';
+      art.appendChild(el('p', 'report-foot', 'Fill in the brackets with real facts before you use this bullet.' + left));
+      show(art);
+    }
+
+    function setLoading(on) {
+      btn.disabled = on;
+      btn.setAttribute('aria-busy', on ? 'true' : 'false');
+      if (on) {
+        btn.innerHTML = '<span class="spinner" aria-hidden="true"></span>Analysing';
+        statusEl.textContent = 'Reading your bullets. This usually takes 5 to 10 seconds.';
+      } else {
+        btn.textContent = 'Analyse';
+      }
+    }
+
+    // Usage line: "127 checks run · Most common gap this week: ... (46%)". Hidden below 5 checks.
+    function loadStats() {
+      fetch('/api/stats')
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (!d || typeof d.total_checks !== 'number' || d.total_checks < 5) { statsEl.hidden = true; return; }
+          var text = d.total_checks.toLocaleString('en-IN') + ' checks run';
+          if (d.top_gap && GAP_LABELS[d.top_gap] && d.top_gap_share != null) {
+            text += ' \u00B7 Most common gap this week: ' + GAP_LABELS[d.top_gap] + ' (' + d.top_gap_share + '%)';
+          }
+          statsEl.textContent = text;
+          statsEl.hidden = false;
+        })
+        .catch(function () { statsEl.hidden = true; });
+    }
+    loadStats();
+
     form.addEventListener('submit', function (e) {
       e.preventDefault();
+      if (btn.disabled) return;
+
+      var fromRole = currentSel.value;
+      var toRole = targetSel.value;
+      var bullets = ta.value.trim();
+      var n = countWords(bullets);
+
+      // Same checks as the server, so most mistakes are caught instantly.
+      if (!fromRole) { showNotice('err', 'One more thing', 'Please choose your current role.'); currentSel.focus(); return; }
+      if (!toRole) { showNotice('err', 'One more thing', 'Please choose your target role.'); targetSel.focus(); return; }
+      if (n < MIN) { showNotice('err', 'A bit more text needed', 'Please paste at least ' + MIN + ' words of resume bullets. You have ' + n + '.'); ta.focus(); return; }
+      if (n > MAX) { showNotice('err', 'Too long', 'Please trim your bullets to ' + MAX + ' words. You have ' + n + '.'); ta.focus(); return; }
+
+      setLoading(true);
+      var ctrl = new AbortController();
+      var timer = setTimeout(function () { ctrl.abort(); }, TIMEOUT_MS); // 20-second limit
+
+      fetch('/api/check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ current_role: fromRole, target_role: toRole, bullets: bullets, visitor_id: visitorId }),
+        signal: ctrl.signal
+      })
+        .then(function (res) {
+          return res.json().catch(function () { return null; }).then(function (data) {
+            var msg = data && data.error;
+            if (res.status === 429) {
+              showNotice('warn', 'Daily limit reached', msg || "You've used today's free checks. Please come back tomorrow.");
+            } else if (!res.ok) {
+              showNotice('err', "Your report couldn't be created", msg || 'Something went wrong on our side. Please try again in a minute.');
+            } else if (data && data.status === 'refused') {
+              showNotice('warn', "This check can't run on that text", data.message || 'ShortlistLens can only review resume bullets for a role switch.');
+            } else if (data && data.status === 'ok' && data.report) {
+              showReport(data.report, fromRole, toRole, data.remaining);
+              loadStats();
+            } else {
+              showNotice('err', "Your report couldn't be created", 'Something went wrong on our side. Please try again in a minute.');
+            }
+          });
+        })
+        .catch(function (err) {
+          if (err && err.name === 'AbortError') {
+            showNotice('err', 'This is taking too long', 'The check took more than 20 seconds. Please try again.');
+          } else {
+            showNotice('err', "Couldn't connect", 'Please check your internet connection and try again.');
+          }
+        })
+        .then(function () {
+          clearTimeout(timer);
+          setLoading(false);
+          statusEl.textContent = DEFAULT_STATUS;
+        });
     });
   })();
 </script>
