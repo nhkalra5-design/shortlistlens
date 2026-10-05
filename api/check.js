@@ -153,8 +153,14 @@ async function callGemini(env, fromRole, toRole, bullets) {
     responseMimeType: 'application/json',
     responseSchema: RESPONSE_SCHEMA
   };
-  // Gemini 2.5 Flash models "think" by default, and thinking eats the 400-token budget. Turn it off.
-  if (/2\.5-flash/.test(model)) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  // Gemini models "think" by default, and thinking tokens eat into the 400-token budget. Keep it to a minimum.
+  if (/^gemini-3/.test(model)) {
+    // Gemini 3+ uses thinkingLevel. Pro models don't support "minimal", so they get "low".
+    generationConfig.thinkingConfig = { thinkingLevel: /pro/.test(model) ? 'low' : 'minimal' };
+  } else if (/2\.5-flash/.test(model)) {
+    // Older 2.5 Flash models use thinkingBudget; 0 switches thinking off.
+    generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  }
 
   // Labelled exactly as the system prompt expects: from_role, to_role, bullets.
   const userText =
