@@ -34,7 +34,9 @@ const DAILY_CAP = 3;            // checks per visitor per 24 hours
 const MIN_WORDS = 20;
 const MAX_WORDS = 250;
 const MAX_CHARS = 3000;         // stops one giant "word" from bypassing the word limit
-const GEMINI_TIMEOUT_MS = 15000; // browser waits 20s, so the server gives up first
+const GEMINI_TIMEOUT_MS = 18000; // total time budget for Gemini; the browser waits 20s, so the server gives up first
+const RETRY_STATUSES = [429, 500, 503]; // "busy" errors from Gemini that are worth one quick retry
+const RETRY_DELAY_MS = 1000;
 
 // ---------- System prompt ----------
 // Your Step 3 prompt, used word for word. The page relies on its field names and gap codes.
@@ -142,8 +144,8 @@ async function logCheck(env, row) {
 }
 
 // Calls Gemini's REST API and returns { report, inputTokens, outputTokens }.
-async function callGemini(env, fromRole, toRole, bullets) {
-  const model = env.GEMINI_MODEL.replace(/^models\//, '');
+async function callGemini(env, modelName, fromRole, toRole, bullets, timeoutMs) {
+  const model = modelName.replace(/^models\//, '');
   const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
     encodeURIComponent(model) + ':generateContent';
 
@@ -153,8 +155,14 @@ async function callGemini(env, fromRole, toRole, bullets) {
     responseMimeType: 'application/json',
     responseSchema: RESPONSE_SCHEMA
   };
-  // Gemini 2.5 Flash models "think" by default, and thinking eats the 400-token budget. Turn it off.
-  if (/2\.5-flash/.test(model)) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  // Gemini models "think" by default, and thinking tokens eat into the 400-token budget. Keep it to a minimum.
+  if (/^gemini-3/.test(model)) {
+    // Gemini 3+ uses thinkingLevel. Pro models don't support "minimal", so they get "low".
+    generationConfig.thinkingConfig = { thinkingLevel: /pro/.test(model) ? 'low' : 'minimal' };
+  } else if (/2\.5-flash/.test(model)) {
+    // Older 2.5 Flash models use thinkingBudget; 0 switches thinking off.
+    generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  }
 
   // Labelled exactly as the system prompt expects: from_role, to_role, bullets.
   const userText =
@@ -170,12 +178,13 @@ async function callGemini(env, fromRole, toRole, bullets) {
       contents: [{ role: 'user', parts: [{ text: userText }] }],
       generationConfig
     }),
-    signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS)
+    signal: AbortSignal.timeout(timeoutMs)
   });
 
   if (!r.ok) {
     const err = new Error('Gemini HTTP ' + r.status + ': ' + (await r.text()).slice(0, 500));
     err.code = 'GEMINI_HTTP';
+    err.status = r.status;
     throw err;
   }
 
@@ -203,6 +212,30 @@ async function callGemini(env, fromRole, toRole, bullets) {
     outputTokens,
     finishReason: candidate ? candidate.finishReason : (data.promptFeedback && data.promptFeedback.blockReason) || 'NO_CANDIDATE'
   };
+}
+
+// Tries the main model; if Gemini is busy (429/500/503), waits 1s and retries,
+// then tries GEMINI_FALLBACK_MODEL if one is set. Stays inside the overall time budget.
+async function callGeminiWithRetry(env, fromRole, toRole, bullets) {
+  const deadline = Date.now() + GEMINI_TIMEOUT_MS;
+  const attempts = [env.GEMINI_MODEL, env.GEMINI_MODEL];
+  if (env.GEMINI_FALLBACK_MODEL) attempts.push(env.GEMINI_FALLBACK_MODEL);
+
+  let lastErr;
+  for (let i = 0; i < attempts.length; i++) {
+    const timeLeft = deadline - Date.now();
+    if (timeLeft < 2000) break; // not enough time for another try
+    try {
+      return await callGemini(env, attempts[i], fromRole, toRole, bullets, timeLeft);
+    } catch (e) {
+      lastErr = e;
+      const busy = e.code === 'GEMINI_HTTP' && RETRY_STATUSES.includes(e.status);
+      console.error('check: attempt', i + 1, 'with', attempts[i], 'failed:', e.name, e.message);
+      if (!busy) throw e; // wrong key, bad request, timeout: retrying won't help
+      await new Promise(function (r) { setTimeout(r, RETRY_DELAY_MS); });
+    }
+  }
+  throw lastErr;
 }
 
 // Checks the parsed report has the fields the page needs. Returns a clean copy or null.
@@ -237,6 +270,7 @@ module.exports = async function handler(req, res) {
   const env = {
     GEMINI_API_KEY: process.env.GEMINI_API_KEY,
     GEMINI_MODEL: process.env.GEMINI_MODEL,
+    GEMINI_FALLBACK_MODEL: process.env.GEMINI_FALLBACK_MODEL, // optional backup model
     SUPABASE_URL: (process.env.SUPABASE_URL || '').replace(/\/+$/, ''),
     SUPABASE_SERVICE_KEY: process.env.SUPABASE_SERVICE_KEY
   };
@@ -289,15 +323,20 @@ module.exports = async function handler(req, res) {
 
   // 4. Call Gemini.
   let result;
+  const started = Date.now(); // timing, so Vercel logs show how long Gemini takes
   try {
-    result = await callGemini(env, fromRole, toRole, bullets);
+    result = await callGeminiWithRetry(env, fromRole, toRole, bullets);
+    console.log('check: Gemini answered in', Date.now() - started, 'ms, finishReason =', result.finishReason,
+      ', tokens in/out =', result.inputTokens, '/', result.outputTokens);
   } catch (e) {
-    console.error('check: Gemini call failed', e.name, e.message);
+    console.error('check: Gemini call failed after', Date.now() - started, 'ms:', e.name, e.message);
     const timedOut = e.name === 'TimeoutError' || e.name === 'AbortError';
     return send(res, timedOut ? 504 : 502, {
       error: timedOut
         ? 'The analysis took too long. Please try again.'
-        : "We couldn't generate your report right now. Please try again in a minute."
+        : (e.status === 503 || e.status === 429)
+          ? 'ShortlistLens is very busy right now. Please try again in a minute.'
+          : "We couldn't generate your report right now. Please try again in a minute."
     });
   }
 
